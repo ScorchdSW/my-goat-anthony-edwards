@@ -49,9 +49,11 @@ def season_for(dt):
     return f'{y}-{str((y+1)%100).zfill(2)}'
 @st.cache_data(ttl=1800, show_spinner=False)
 def upcoming_games_fixed_ids():
-    """Fetch ESPN NBA fixtures for the next 8 Melbourne calendar days."""
+    """Fetch fixtures, retaining yesterday until 6am Melbourne time."""
     now = datetime.now(timezone.utc)
-    start = now.astimezone(MEL).date()
+    local_now = now.astimezone(MEL)
+    # Keep yesterday's matchups selectable until 6 am Melbourne time.
+    start = local_now.date() - timedelta(days=1) if local_now.hour < 6 else local_now.date()
     games = {}
     errors = []
     successful_days = 0
@@ -76,7 +78,10 @@ def upcoming_games_fixed_ids():
         for event in events:
             try:
                 when = datetime.fromisoformat(event['date'].replace('Z', '+00:00'))
-                if not now - timedelta(hours=3) <= when <= now + timedelta(days=9):
+                # Filter by Melbourne calendar date, not hours since tipoff.
+                # This prevents games disappearing when the clock hits midnight.
+                local_game_day = when.astimezone(MEL).date()
+                if not start <= local_game_day <= local_now.date() + timedelta(days=8):
                     continue
                 competitors = event['competitions'][0]['competitors']
                 home_data = next(c['team'] for c in competitors if c['homeAway'] == 'home')
