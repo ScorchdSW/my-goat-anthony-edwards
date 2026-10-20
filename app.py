@@ -127,95 +127,88 @@ def _parse_shooting(value):
 
 
 def _extract_games(payload):
-    # ESPN web-v3 game logs: labels and statistics may be nested in seasonTypes/categories.
-    results = []
-    events = payload.get('events', {})
+    """Read ESPN's seasonTypes -> categories -> events game-log layout."""
+    events = payload.get('events') or {}
     if isinstance(events, list):
-        events = {str(e.get('id')): e for e in events if isinstance(e, dict) and e.get('id')}
+        events = {str(x['id']): x for x in events if isinstance(x, dict) and x.get('id')}
     if not isinstance(events, dict):
         events = {}
-
-    def walk(node, labels=None, category=''):
-        if isinstance(node, list):
-            for item in node:
-                walk(item, labels, category)
-            return
-        if not isinstance(node, dict):
-            return
-        local_labels = node.get('labels') or node.get('statNames') or labels
-        if isinstance(local_labels, dict):
-            local_labels = list(local_labels.values())
-        local_category = str(node.get('displayName') or node.get('name') or category)
-        stats = node.get('stats') or node.get('statistics')
-        event_id = str(node.get('eventId') or node.get('eventID') or node.get('id') or '')
-        if isinstance(stats, list) and stats and event_id and (event_id in events or node.get('opponent')):
-            results.append((event_id, stats, local_labels, local_category, node))
-        for key, value in node.items():
-            if key in ('events', 'labels', 'statNames', 'stats', 'statistics'):
-                continue
-            if isinstance(value, (dict, list)):
-                walk(value, local_labels, local_category)
-
-    walk(payload, payload.get('labels'))
-    # Some ESPN responses group events under categories and use event IDs as dictionary keys.
-    def find_by_id(node, labels=None, category=''):
-        if isinstance(node, list):
-            for item in node:
-                find_by_id(item, labels, category)
-        elif isinstance(node, dict):
-            labels = node.get('labels') or labels
-            category = str(node.get('displayName') or node.get('name') or category)
-            for key, value in node.items():
-                if isinstance(value, dict) and key in events:
-                    stats = value.get('stats') or value.get('statistics')
-                    if isinstance(stats, list):
-                        results.append((key, stats, labels, category, value))
-                if isinstance(value, (dict, list)):
-                    find_by_id(value, labels, category)
-    find_by_id(payload, payload.get('labels'))
+    labels = payload.get('labels') or []
+    if not isinstance(labels, list):
+        labels = []
     rows = []
     seen = set()
-    defaults = ['MIN', 'FG', '3PT', 'FT', 'REB', 'AST', 'BLK', 'STL', 'PF', 'TO', 'PTS']
-    for event_id, stats, labels, category, item in results:
-        if event_id in seen or 'preseason' in category.lower() or 'postseason' in category.lower() or 'playoff' in category.lower():
+
+    def collect(category, season_type):
+        if not isinstance(category, dict):
+            return
+        name = str(category.get('displayName') or category.get('name') or '').lower()
+        if category.get('type') == 'total' or 'total' in name or 'average' in name:
+            return
+        local_labels = category.get('labels') or labels
+        for entry in category.get('events') or []:
+            if not isinstance(entry, dict):
+                continue
+            eid = str(entry.get('eventId') or entry.get('eventID') or entry.get('id') or '')
+            if not eid or eid in seen:
+                continue
+            stats = entry.get('stats') or entry.get('statistics')
+            if not isinstance(stats, list) or not stats:
+                continue
+            if isinstance(stats[0], dict):
+                values = {str(x.get('name') or x.get('abbreviation') or x.get('label') or '').upper(): x.get('value') for x in stats}
+            else:
+                use_labels = local_labels if len(local_labels) == len(stats) else []
+                if not use_labels:
+                    continue  # Don't mislabel statistics
+                values = dict(zip((str(x).upper() for x in use_labels), stats))
+            if 'PTS' not in values and 'POINTS' not in values:
+                continue
+            meta = events.get(eid, {})
+            if not isinstance(meta, dict):
+                meta = {}
+            opp = meta.get('opponent') or entry.get('opponent') or {}
+            if not isinstance(opp, dict):
+                opp = {}
+            abbr = opp.get('abbreviation') or ''
+            home_away = str(meta.get('atVs') or entry.get('atVs') or 'vs').lower()
+            is_away = home_away in ('@', 'away', 'at')
+            def val(*keys):
+                for k in keys:
+                    if k in values:
+                        return values[k]
+                return 0
+            def num(v):
+                try: return float(v)
+                except (ValueError, TypeError): return 0.0
+            fgm, fga = _parse_shooting(val('FG', 'FGM-FGA'))
+            fg3m, fg3a = _parse_shooting(val('3PT', '3PM-3PA', 'FG3M-FG3A'))
+            ftm, fta = _parse_shooting(val('FT', 'FTM-FTA'))
+            date = meta.get('gameDate') or meta.get('date') or entry.get('date')
+            if not date:
+                continue
+            rows.append({'Game_ID': eid, 'GAME_DATE': date,
+                         'MATCHUP': ('@ ' if is_away else 'vs. ') + str(abbr),
+                         'MIN': num(val('MIN')), 'PTS': num(val('PTS', 'POINTS')),
+                         'REB': num(val('REB')), 'AST': num(val('AST')),
+                         'STL': num(val('STL')), 'BLK': num(val('BLK')),
+                         'TOV': num(val('TO', 'TOV')), 'FGM': fgm, 'FGA': fga,
+                         'FG3M': fg3m, 'FG3A': fg3a, 'FTM': ftm, 'FTA': fta})
+            seen.add(eid)
+
+    for season_type in payload.get('seasonTypes') or []:
+        if not isinstance(season_type, dict):
             continue
-        if isinstance(stats[0], dict):
-            vals = {str(x.get('name') or x.get('abbreviation') or x.get('label') or '').upper(): x.get('value') for x in stats}
-        else:
-            labels = labels if isinstance(labels, list) and len(labels) == len(stats) else defaults
-            vals = {str(k).upper(): v for k, v in zip(labels, stats)}
-        def get(*keys):
-            for key in keys:
-                if key in vals:
-                    return vals[key]
-            return 0
-        # Reject non-boxscore rows rather than presenting misleading zero stats.
-        if not any(k in vals for k in ('PTS', 'POINTS')):
+        typ = str(season_type.get('id') or season_type.get('type') or '').lower()
+        label = str(season_type.get('displayName') or season_type.get('name') or '').lower()
+        if typ in ('1', '3', '4') or any(x in label for x in ('preseason', 'postseason', 'playoff')):
             continue
-        event = events.get(event_id, {})
-        if not isinstance(event, dict):
-            event = {}
-        opp = event.get('opponent', item.get('opponent', {}))
-        if not isinstance(opp, dict):
-            opp = {}
-        abbr = opp.get('abbreviation', '')
-        at_home = event.get('atVs', item.get('atVs', 'vs'))
-        home = str(at_home).lower() not in ('@', 'away', 'at')
-        fgm, fga = _parse_shooting(get('FG', 'FGM-FGA'))
-        fg3m, fg3a = _parse_shooting(get('3PT', '3PM-3PA', 'FG3M-FG3A'))
-        ftm, fta = _parse_shooting(get('FT', 'FTM-FTA'))
-        def num(v):
-            try: return float(v)
-            except (TypeError, ValueError): return 0.0
-        rows.append({'Game_ID': event_id,
-                     'GAME_DATE': event.get('gameDate') or event.get('date') or item.get('date'),
-                     'MATCHUP': ('vs. ' if home else '@ ') + str(abbr),
-                     'MIN': num(get('MIN')), 'PTS': num(get('PTS', 'POINTS')),
-                     'REB': num(get('REB')), 'AST': num(get('AST')),
-                     'STL': num(get('STL')), 'BLK': num(get('BLK')),
-                     'TOV': num(get('TO', 'TOV')), 'FGM': fgm, 'FGA': fga,
-                     'FG3M': fg3m, 'FG3A': fg3a, 'FTM': ftm, 'FTA': fta})
-        seen.add(event_id)
+        for category in season_type.get('categories') or []:
+            collect(category, season_type)
+    # Support payloads where categories are at the top level.
+    if not rows:
+        for category in payload.get('categories') or []:
+            collect(category, {})
     return pd.DataFrame(rows)
 
 @st.cache_data(ttl=10800, show_spinner=False)
@@ -227,15 +220,17 @@ def season_games(player_id, season):
 
 @st.cache_data(ttl=10800,show_spinner=False)
 def player_history(player_id,season,number_seasons=5):
-    start=int(season[:4]);parts=[]
+    start=int(season[:4]);parts=[];failures=[]
     for y in range(start,start-number_seasons,-1):
         s=f'{y}-{str((y+1)%100).zfill(2)}'
         try:
             part=season_games(player_id,s)
             if not part.empty:parts.append(part)
-        except Exception:
+        except Exception as exc:
+            failures.append(f"{s}: {type(exc).__name__}: {exc}")
             continue
-    if not parts:return pd.DataFrame()
+    if not parts:
+        raise RuntimeError('No usable game logs. ' + ('; '.join(failures[:2]) if failures else 'ESPN returned no historical games for these seasons.'))
     df=pd.concat(parts,ignore_index=True)
     df['GAME_DATE']=pd.to_datetime(df['GAME_DATE'],errors='coerce')
     df=df.dropna(subset=['GAME_DATE']).sort_values('GAME_DATE',ascending=False).drop_duplicates(subset=['Game_ID'],keep='first') if 'Game_ID' in df else df.sort_values('GAME_DATE',ascending=False)
@@ -481,7 +476,7 @@ if saved_leaders and saved_leaders[0] == leader_key:
             else:
                 st.info('Not enough player data for this team.')
     else:
-        st.warning('No predictions could be calculated. ESPN may be rate-limiting requests.')
+        st.warning('No predictions could be calculated. Try an individual player; any data-loading error will appear there.')
     st.markdown('### 🚀 Top 4 higher-upside opportunities · Both teams')
     st.caption('The four most likely unusually high milestones from the players analysed. Each target is at least 35% above that player’s recent average, with a model estimate between 8% and 45%. These are NOT safe or proven profitable bets.')
     if not all_upside.empty:
