@@ -15,23 +15,40 @@ def espn_json(url, params=None):
     response.raise_for_status()
     return response.json()
 
-@st.cache_data(ttl=86400, show_spinner=False)
-def espn_teams():
-    data = espn_json('https://site.api.espn.com/apis/site/v2/sports/basketball/nba/teams', {'limit': 100})
-    entries = data['sports'][0]['leagues'][0]['teams']
-    return [{'id': int(item['team']['id']), 'full_name': item['team']['displayName'],
-             'abbreviation': item['team']['abbreviation']} for item in entries]
-
-TEAM_LIST = espn_teams()
+# ESPN uses its own team IDs (Boston = 2), NOT NBA Stats IDs (Boston = 1610612738).
+# Keeping this mapping local also prevents a broken team-list response from hiding names.
+ESPN_TEAM_IDS = {
+    'ATL': 1, 'BOS': 2, 'NOP': 3, 'CHI': 4, 'CLE': 5,
+    'DAL': 6, 'DEN': 7, 'DET': 8, 'GSW': 9, 'HOU': 10,
+    'IND': 11, 'LAC': 12, 'LAL': 13, 'MIA': 14, 'MIL': 15,
+    'MIN': 16, 'BKN': 17, 'NYK': 18, 'ORL': 19, 'PHI': 20,
+    'PHX': 21, 'POR': 22, 'SAC': 23, 'SAS': 24, 'OKC': 25,
+    'UTA': 26, 'WAS': 27, 'TOR': 28, 'MEM': 29, 'CHA': 30,
+}
+ESPN_TEAM_NAMES = {
+    'ATL': 'Atlanta Hawks', 'BOS': 'Boston Celtics', 'NOP': 'New Orleans Pelicans',
+    'CHI': 'Chicago Bulls', 'CLE': 'Cleveland Cavaliers', 'DAL': 'Dallas Mavericks',
+    'DEN': 'Denver Nuggets', 'DET': 'Detroit Pistons', 'GSW': 'Golden State Warriors',
+    'HOU': 'Houston Rockets', 'IND': 'Indiana Pacers', 'LAC': 'LA Clippers',
+    'LAL': 'Los Angeles Lakers', 'MIA': 'Miami Heat', 'MIL': 'Milwaukee Bucks',
+    'MIN': 'Minnesota Timberwolves', 'BKN': 'Brooklyn Nets', 'NYK': 'New York Knicks',
+    'ORL': 'Orlando Magic', 'PHI': 'Philadelphia 76ers', 'PHX': 'Phoenix Suns',
+    'POR': 'Portland Trail Blazers', 'SAC': 'Sacramento Kings',
+    'SAS': 'San Antonio Spurs', 'OKC': 'Oklahoma City Thunder',
+    'UTA': 'Utah Jazz', 'WAS': 'Washington Wizards', 'TOR': 'Toronto Raptors',
+    'MEM': 'Memphis Grizzlies', 'CHA': 'Charlotte Hornets',
+}
+TEAM_LIST = [{'id': espn_id, 'full_name': ESPN_TEAM_NAMES[abbr], 'abbreviation': abbr}
+             for abbr, espn_id in ESPN_TEAM_IDS.items()]
 TEAMS = {t['id']: t for t in TEAM_LIST}
-BY_NAME = {t['full_name'].lower():t for t in TEAM_LIST}
+BY_NAME = {t['full_name'].lower(): t for t in TEAM_LIST}
 STATS = {'Points':'PTS','Rebounds':'REB','Assists':'AST','3-pointers':'FG3M','Steals':'STL','Blocks':'BLK','Turnovers':'TOV','Points + Rebounds':'PR','Points + Assists':'PA','Rebounds + Assists':'RA','Points + Rebounds + Assists':'PRA','Double-double':'DD','Triple-double':'TD'}
 THRESHOLDS = {'Points':list(range(5,51,5)),'Rebounds':list(range(2,21,2)),'Assists':list(range(2,21,2)),'3-pointers':list(range(1,11)),'Steals':list(range(1,7)),'Blocks':list(range(1,7)),'Turnovers':list(range(1,9)),'Points + Rebounds':list(range(10,66,5)),'Points + Assists':list(range(10,66,5)),'Rebounds + Assists':list(range(5,41,5)),'Points + Rebounds + Assists':list(range(10,81,5)),'Double-double':[1],'Triple-double':[1]}
 def season_for(dt):
     y=dt.year if dt.month>=10 else dt.year-1
     return f'{y}-{str((y+1)%100).zfill(2)}'
 @st.cache_data(ttl=1800, show_spinner=False)
-def upcoming_games():
+def upcoming_games_fixed_ids():
     """Fetch ESPN NBA fixtures for the next 8 Melbourne calendar days."""
     now = datetime.now(timezone.utc)
     start = now.astimezone(MEL).date()
@@ -67,7 +84,8 @@ def upcoming_games():
                 def find_team(data):
                     name = data.get('displayName', '').lower()
                     abbr = data.get('abbreviation', '').upper()
-                    return BY_NAME.get(name) or by_abbr.get(espn_abbreviations.get(abbr, abbr))
+                    canonical_abbr = espn_abbreviations.get(abbr, abbr)
+                    return by_abbr.get(canonical_abbr) or BY_NAME.get(name) or TEAMS.get(int(data.get('id', 0) or 0))
                 home_team, away_team = find_team(home_data), find_team(away_data)
                 if home_team is None or away_team is None:
                     continue
@@ -365,7 +383,7 @@ st.caption('NBA milestone explorer · Melbourne time · Shareable dashboard · N
 st.info('SportsEdge now includes **experimental mathematical estimates** as well as historical hit rates. Estimates are not backtested or calibrated, and are not betting advice.')
 try:
     with st.spinner("Loading upcoming NBA games from ESPN (this can take a few seconds)..."):
-        games=upcoming_games()
+        games=upcoming_games_fixed_ids()
 except Exception as exc:
     st.error(f'Could not load the NBA schedule right now: {exc}')
     st.info('The alternate ESPN schedule service may be temporarily unavailable. Try refreshing later.')
